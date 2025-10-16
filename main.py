@@ -262,8 +262,25 @@ async def add_to_cart(req: AddToCartRequest, user_phone: str = Depends(get_curre
 @app.get("/cart")
 async def get_cart(user_phone: str = Depends(get_current_user)):
     logger.info("Fetching cart for user: %s", user_phone)
+    # Get user cart
     cart = await carts_col().find_one({"phone": user_phone}, {"_id": 0, "items": 1})
-    return {"cart": cart["items"] if cart else []}
+    if not cart or not cart.get("items"):
+        return {"cart": []}
+
+    detailed_items = []
+    for item in cart["items"]:
+        # Fetch product details by ID
+        product = await products_collection.find_one({"id": str(item["id"])}, {"_id": 0})
+        if product:
+            detailed_items.append({
+                "id": product["id"],
+                "name": product.get("name"),
+                "image": product.get("image"),
+                "price": product.get("price"),
+                "quantity": item["qty"],  # quantity user added in cart
+            })
+
+    return {"cart": detailed_items}
 
 
 # ----- USER DETAILS -----
