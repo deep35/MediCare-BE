@@ -364,6 +364,24 @@ async def get_orders(user_phone: str = Depends(get_current_user)):
     return {"orders": orders}
 
 
+@app.get("/admin/orders")
+async def get_all_orders():
+    """This is for admin side Order list getting"""
+    logger.info("Fetching all orders for admin")
+
+    cursor = orders_col().find({}, {"_id": 1, "status": 1, "created_at": 1, "user.phone": 1})
+
+    orders = []
+    async for order in cursor:
+        orders.append({
+            "order_id": str(order["_id"]),
+            "status": order.get("status", "Unknown"),
+            "created_at": order.get("created_at"),
+            "phone": order.get("user", {}).get("phone", "Unknown")
+        })
+
+    return {"orders": orders}
+
 # ----- ORDER STATUS + DELIVERY OTP -----
 @app.post("/order/update-status/{order_id}")
 async def update_order_status(order_id: str, status: str):
