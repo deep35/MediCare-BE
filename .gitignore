@@ -1,0 +1,4 @@
+./__pycache__
+.env
+token_gen.py
+redis_data.py

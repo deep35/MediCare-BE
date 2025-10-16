@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OTP Login</title>
+  <style>
+    body {
+      font-family: 'Poppins', sans-serif;
+      background: linear-gradient(135deg, #667eea, #764ba2);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      margin: 0;
+      color: #111827;
+    }
+
+    .container {
+      background: #fff;
+      padding: 2rem 2.5rem;
+      border-radius: 12px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+      width: 380px;
+      text-align: center;
+      transition: all 0.3s ease;
+    }
+
+    h1 {
+      margin-bottom: 2rem;
+      color: #4b5563;
+    }
+
+    label {
+      font-weight: 600;
+      display: block;
+      margin-bottom: 0.5rem;
+      text-align: left;
+    }
+
+    select, input {
+      padding: 0.65rem;
+      border-radius: 8px;
+      border: 1px solid #d1d5db;
+      font-size: 1rem;
+      outline: none;
+      transition: 0.2s all;
+    }
+
+    select:focus, input:focus {
+      border-color: #6366f1;
+      box-shadow: 0 0 5px rgba(99,102,241,0.3);
+    }
+
+    .flex {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 1rem;
+    }
+
+    .flex select { flex: 1 0 40%; }
+    .flex input { flex: 1 0 60%; }
+
+    button {
+      width: 100%;
+      padding: 0.75rem;
+      border: none;
+      border-radius: 8px;
+      background: #6366f1;
+      color: #fff;
+      font-weight: 600;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: all 0.3s;
+    }
+
+    button:hover {
+      background: #4f46e5;
+      transform: translateY(-2px);
+    }
+
+    #otpContainer {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 1rem;
+    }
+
+    .otp-input {
+      width: 45px;
+      height: 55px;
+      font-size: 1.5rem;
+      text-align: center;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      transition: 0.2s all;
+    }
+
+    .otp-input:focus {
+      border-color: #6366f1;
+      box-shadow: 0 0 5px rgba(99,102,241,0.3);
+    }
+
+    #accessToken {
+      word-break: break-word;
+      background: #f3f4f6;
+      border: 1px solid #d1d5db;
+      padding: 0.8rem;
+      margin-top: 1rem;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      position: relative;
+      animation: fadeIn 0.5s ease forwards;
+    }
+
+    #copyBtn {
+      position: absolute;
+      top: 5px;
+      right: 5px;
+      padding: 0.25rem 0.5rem;
+      font-size: 0.75rem;
+      cursor: pointer;
+      border: none;
+      background: #6366f1;
+      color: #fff;
+      border-radius: 4px;
+      transition: 0.2s all;
+    }
+
+    #copyBtn:hover { background: #4f46e5; }
+
+    .fadeIn { animation: fadeIn 0.3s ease forwards; }
+    @keyframes fadeIn { from {opacity:0;} to {opacity:1;} }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <h1>OTP Login</h1>
+
+    <div id="step1" class="fadeIn">
+      <label>Phone Number</label>
+      <div class="flex">
+        <select id="countryCode">
+          <option value="+91">India (+91)</option>
+          <option value="+1">USA (+1)</option>
+          <option value="+44">UK (+44)</option>
+          <option value="+61">Australia (+61)</option>
+          <option value="+81">Japan (+81)</option>
+        </select>
+        <input type="tel" id="phone" placeholder="Phone number">
+      </div>
+      <button onclick="sendOtp()">Send OTP</button>
+    </div>
+
+    <div id="step2" class="fadeIn" style="display:none;">
+      <label>Enter OTP</label>
+      <div id="otpContainer">
+        <input class="otp-input" maxlength="1" type="text">
+        <input class="otp-input" maxlength="1" type="text">
+        <input class="otp-input" maxlength="1" type="text">
+        <input class="otp-input" maxlength="1" type="text">
+        <input class="otp-input" maxlength="1" type="text">
+        <input class="otp-input" maxlength="1" type="text">
+      </div>
+      <button onclick="verifyOtp()">Verify OTP</button>
+    </div>
+
+    <div id="accessToken" style="display:none;">
+      <button id="copyBtn" onclick="copyToken()">Copy</button>
+      <strong>Access Token:</strong><br>
+      <span id="tokenValue"></span>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = "http://localhost:8000"; // Change to your FastAPI URL
+
+    const otpInputs = document.querySelectorAll(".otp-input");
+    otpInputs.forEach((input, i) => {
+      input.addEventListener("input", () => {
+        if (input.value.length === 1 && i < otpInputs.length - 1) {
+          otpInputs[i+1].focus();
+        }
+      });
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Backspace" && !input.value && i > 0) {
+          otpInputs[i-1].focus();
+        }
+      });
+    });
+
+    async function sendOtp() {
+      const phone = document.getElementById("phone").value.trim();
+      const countryCode = document.getElementById("countryCode").value;
+      if (!phone) { alert("Enter phone number"); return; }
+
+      const res = await fetch(`${API_BASE}/send-otp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone_number: countryCode + phone })
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        alert("OTP sent!");
+        document.getElementById("step1").style.display = "none";
+        document.getElementById("step2").style.display = "block";
+        otpInputs[0].focus();
+      } else {
+        alert(data.detail || "Failed to send OTP");
+      }
+    }
+
+    async function verifyOtp() {
+      const phone = document.getElementById("phone").value.trim();
+      const countryCode = document.getElementById("countryCode").value;
+      const otp = Array.from(otpInputs).map(i => i.value).join("");
+      if (otp.length !== 6) { alert("Enter full 6-digit OTP"); return; }
+
+      const res = await fetch(`${API_BASE}/verify-otp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone_number: countryCode + phone, otp })
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        alert("OTP verified!");
+        document.getElementById("step2").style.display = "none";
+        const tokenDiv = document.getElementById("accessToken");
+        tokenDiv.style.display = "block";
+        document.getElementById("tokenValue").innerText = data.access_token;
+      } else {
+        alert(data.detail || "Invalid OTP");
+      }
+    }
+
+    function copyToken() {
+      const token = document.getElementById("tokenValue").innerText;
+      navigator.clipboard.writeText(token).then(() => {
+        alert("Token copied to clipboard!");
+      });
+    }
+  </script>
+
+</body>
+</html>
