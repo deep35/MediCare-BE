@@ -161,7 +161,7 @@ async def startup():
     products_collection = db["products_collection"]
     carts_col = lambda: db["carts"]
     orders_col = lambda: db["orders"]
-    logger.info(f"Connected to Redis + MongoDB")
+    logger.info("Startup: Connected to Redis and MongoDB")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -170,49 +170,56 @@ async def shutdown():
         await redis.close()
     if mongo_client:
         mongo_client.close()
+    logger.info("Shutdown: Connections to Redis and MongoDB closed")
 
 
 # Endpoints
 @app.post("/send-otp")
 async def send_otp_route(req: PhoneRequest, background_tasks: BackgroundTasks):
+    logger.info("Received OTP request for phone number: %s", req.phone_number)
     try:
         phone = normalize_phone_e164(req.phone_number)
     except ValueError as e:
+        logger.warning("Invalid phone number format: %s", req.phone_number)
         raise HTTPException(status_code=400, detail=str(e))
 
-    # generate OTP, store hashed in Redis with TTL
     otp = generate_otp(6)
     hashed = hmac_hash(otp)
     await redis.set(otp_key(phone), hashed, ex=OTP_TTL_SECONDS)
+    logger.info("OTP generated and stored (hashed) in Redis for phone: %s", phone)
 
-    # deliver OTP in background
     background_tasks.add_task(deliver_otp, phone, otp)
+    logger.info("OTP delivery task added to background for phone: %s", phone)
 
     return {"detail": "OTP dispatched", "ttl_seconds": OTP_TTL_SECONDS}
 
+
 @app.post("/verify-otp")
 async def verify_otp_route(req: VerifyRequest):
+    logger.info("Verifying OTP for phone: %s", req.phone_number)
     try:
         phone = normalize_phone_e164(req.phone_number)
     except ValueError:
+        logger.warning("Invalid phone number format during verification: %s", req.phone_number)
         raise HTTPException(status_code=400, detail="Invalid phone number")
 
-    # fetch stored OTP
     stored = await redis.get(otp_key(phone))
     if not stored:
+        logger.warning("OTP not found or expired for phone: %s", phone)
         raise HTTPException(status_code=400, detail="OTP not found or expired")
 
-    # check HMAC
     provided_h = hmac_hash(req.otp)
     if not hmac.compare_digest(provided_h, stored):
+        logger.warning("Invalid OTP provided for phone: %s", phone)
         raise HTTPException(status_code=400, detail="Invalid OTP")
 
-    # success: delete OTP
     await redis.delete(otp_key(phone))
+    logger.info("OTP verified and deleted for phone: %s", phone)
 
-    # generate JWT token
     access_token = create_access_token(phone)
+    logger.info("Access token generated for phone: %s", phone)
     return {"access_token": access_token, "token_type": "bearer"}
+
 
 
 # ----- PRODUCTS API -----
@@ -228,6 +235,7 @@ async def get_products():
 # ----- ADD TO CART -----
 @app.post("/cart/add")
 async def add_to_cart(req: AddToCartRequest, user_phone: str = Depends(get_current_user)):
+    logger.info("User %s is adding product %s (qty=%s) to cart", user_phone, req.product_id, req.quantity)
     product = await products_collection.find_one({"id": str(req.product_id)})  # IDs are strings now
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -247,11 +255,13 @@ async def add_to_cart(req: AddToCartRequest, user_phone: str = Depends(get_curre
         cart["items"].append({"id": str(req.product_id), "qty": req.quantity})
 
     await carts_col().update_one({"phone": user_phone}, {"$set": cart}, upsert=True)
+    logger.info("Cart updated for user: %s", user_phone)
     return {"message": "Added to cart", "cart": cart["items"]}
 
 
 @app.get("/cart")
 async def get_cart(user_phone: str = Depends(get_current_user)):
+    logger.info("Fetching cart for user: %s", user_phone)
     cart = await carts_col().find_one({"phone": user_phone}, {"_id": 0, "items": 1})
     return {"cart": cart["items"] if cart else []}
 
@@ -259,17 +269,20 @@ async def get_cart(user_phone: str = Depends(get_current_user)):
 # ----- USER DETAILS -----
 @app.post("/user/details")
 async def save_user_details(details: UserDetails, user_phone: str = Depends(get_current_user)):
+    logger.info("Saving user details for phone: %s", user_phone)
     user_data = {**details.dict(), "phone": user_phone}
     await users_col().update_one(
         {"phone": user_phone},
         {"$set": user_data},
         upsert=True
     )
+    logger.info("User details saved for phone: %s", user_phone)
     return {"message": "User details saved", "user": user_data}
 
 
 @app.get("/user/details")
 async def get_user_details(user_phone: str = Depends(get_current_user)):
+    logger.info("Fetching user details for phone: %s", user_phone)
     user = await users_col().find_one({"phone": user_phone}, {"_id": 0})
     return {"user": user or {}}
 
@@ -277,6 +290,7 @@ async def get_user_details(user_phone: str = Depends(get_current_user)):
 # ----- PLACE ORDER -----
 @app.post("/order/place")
 async def place_order(user_phone: str = Depends(get_current_user)):
+    logger.info("User %s is placing an order", user_phone)
     # Fetch cart
     cart = await carts_col().find_one({"phone": user_phone})
     if not cart or not cart.get("items"):
@@ -315,6 +329,7 @@ async def place_order(user_phone: str = Depends(get_current_user)):
 
     # Clear user cart
     await carts_col().delete_one({"phone": user_phone})
+    logger.info("Order created with ID %s for user %s", str(result.inserted_id), user_phone)
 
     # Return response safely, converting ObjectIds to string if any
     response_data = {
@@ -322,6 +337,7 @@ async def place_order(user_phone: str = Depends(get_current_user)):
         "order_id": str(result.inserted_id),
         "order": order
     }
+    logger.info("Cart cleared after order placed for user %s", user_phone)
 
     return jsonable_encoder(response_data, custom_encoder={ObjectId: str})
 
@@ -334,6 +350,7 @@ async def get_orders(user_phone: str = Depends(get_current_user)):
 # ----- ORDER STATUS + DELIVERY OTP -----
 @app.post("/order/update-status/{order_id}")
 async def update_order_status(order_id: str, status: str):
+    logger.info("Updating status for order %s to %s", order_id, status)
     if status not in ["Order Placed", "Dispatched", "Delivered", "Cancelled"]:
         raise HTTPException(status_code=400, detail="Invalid order status")
 
@@ -347,11 +364,13 @@ async def update_order_status(order_id: str, status: str):
         raise HTTPException(status_code=404, detail="Order not found")
 
     await orders_col().update_one({"_id": obj_id}, {"$set": {"status": status}})
+    logger.info("Order %s status updated to %s", order_id, status)
     return {"message": f"Order status updated to {status}"}
 
 
 @app.post("/order/send-delivery-otp/{order_id}")
 async def send_delivery_otp(order_id: str, background_tasks: BackgroundTasks):
+    logger.info("Request to send delivery OTP for order: %s", order_id)
     try:
         obj_id = ObjectId(order_id)
     except Exception:
@@ -375,7 +394,7 @@ async def send_delivery_otp(order_id: str, background_tasks: BackgroundTasks):
     await redis.set(delivery_otp_key(order_id), hashed, ex=OTP_TTL_SECONDS)
     background_tasks.add_task(deliver_otp, phone, otp)
 
-    logger.info(f"Delivery OTP sent for order {order_id} to {phone}")
+    logger.info("Delivery OTP stored in Redis and background task queued for order: %s", order_id)
     return {
         "message": f"Delivery OTP sent to {phone}",
         "ttl_seconds": OTP_TTL_SECONDS
@@ -385,6 +404,7 @@ async def send_delivery_otp(order_id: str, background_tasks: BackgroundTasks):
 
 @app.post("/order/verify-delivery")
 async def verify_order_delivery(req: VerifyOrderDeliveryRequest):
+    logger.info("Verifying delivery OTP for order: %s", req.order_id)
     stored = await redis.get(delivery_otp_key(req.order_id))
     if not stored:
         raise HTTPException(status_code=400, detail="OTP not found or expired")
@@ -401,6 +421,8 @@ async def verify_order_delivery(req: VerifyOrderDeliveryRequest):
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
+    logger.info("OTP verified. Updating order status and reducing inventory.")
+
     await orders_col().update_one({"_id": obj_id}, {"$set": {"status": "Delivered"}})
     await redis.delete(delivery_otp_key(req.order_id))
 
@@ -410,7 +432,7 @@ async def verify_order_delivery(req: VerifyOrderDeliveryRequest):
             {"id": item["id"]},
             {"$inc": {"quantity": -item["qty"]}}
         )
-
+    logger.info("Order %s marked as delivered", req.order_id)
     return {
         "message": "Order delivery verified and stock updated",
         "order_id": req.order_id,
