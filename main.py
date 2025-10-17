@@ -236,27 +236,58 @@ async def get_products():
 @app.post("/cart/add")
 async def add_to_cart(req: AddToCartRequest, user_phone: str = Depends(get_current_user)):
     logger.info("User %s is adding product %s (qty=%s) to cart", user_phone, req.product_id, req.quantity)
-    product = await products_collection.find_one({"id": str(req.product_id)})  # IDs are strings now
+
+    # Find product in MongoDB
+    product = await products_collection.find_one({"id": str(req.product_id)})
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    if req.quantity <= 0:
-        raise HTTPException(status_code=400, detail="Quantity must be positive")
+    available_qty = product.get("quantity", 0)
+    if req.quantity < 0:
+        raise HTTPException(status_code=400, detail="Quantity must be 0 or more")
+    if req.quantity > available_qty:
+        raise HTTPException(status_code=400, detail=f"Only {available_qty} items available in stock")
 
+    # Fetch user's cart
     cart = await carts_col().find_one({"phone": user_phone})
     if not cart:
         cart = {"phone": user_phone, "items": []}
 
+    # If quantity == 0 → remove this product from the cart
+    if req.quantity == 0:
+        cart["items"] = [item for item in cart["items"] if item["id"] != str(req.product_id)]
+
+        if cart["items"]:
+            await carts_col().update_one({"phone": user_phone}, {"$set": cart})
+        else:
+            await carts_col().delete_one({"phone": user_phone})
+
+        logger.info("Removed product %s from cart for user %s", req.product_id, user_phone)
+        return {"message": "Product removed from cart", "cart": cart.get("items", [])}
+
+    # Otherwise, update or add item
+    item_found = False
     for item in cart["items"]:
         if item["id"] == str(req.product_id):
-            item["qty"] += req.quantity
+            new_qty = item["qty"] + req.quantity
+            if new_qty > available_qty:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot add more than {available_qty} items to cart (already {item['qty']} added)"
+                )
+            item["qty"] = new_qty
+            item_found = True
             break
-    else:
+
+    if not item_found:
         cart["items"].append({"id": str(req.product_id), "qty": req.quantity})
 
+    # Save back to DB
     await carts_col().update_one({"phone": user_phone}, {"$set": cart}, upsert=True)
     logger.info("Cart updated for user: %s", user_phone)
+
     return {"message": "Added to cart", "cart": cart["items"]}
+
 
 
 @app.get("/cart")
