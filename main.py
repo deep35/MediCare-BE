@@ -26,6 +26,7 @@ load_dotenv()
 # Config (from env)
 REDIS_URL = os.getenv("REDIS_URL")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 HMAC_SECRET = os.getenv("HMAC_SECRET") or secrets.token_hex(32)
@@ -235,58 +236,63 @@ async def get_products():
 # ----- ADD TO CART -----
 @app.post("/cart/add")
 async def add_to_cart(req: AddToCartRequest, user_phone: str = Depends(get_current_user)):
-    logger.info("User %s is adding product %s (qty=%s) to cart", user_phone, req.product_id, req.quantity)
+    logger.info("User %s is updating product %s (qty change=%s) in cart", user_phone, req.product_id, req.quantity)
 
-    # Find product in MongoDB
+    # Fetch product
     product = await products_collection.find_one({"id": str(req.product_id)})
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
+    product_id = str(req.product_id)
     available_qty = product.get("quantity", 0)
-    if req.quantity < 0:
-        raise HTTPException(status_code=400, detail="Quantity must be 0 or more")
-    if req.quantity > available_qty:
-        raise HTTPException(status_code=400, detail=f"Only {available_qty} items available in stock")
+    product_info = {
+        "id": product_id,
+        "name": product.get("name"),
+        "price": product.get("price"),
+        "image": product.get("image"),
+    }
 
-    # Fetch user's cart
-    cart = await carts_col().find_one({"phone": user_phone})
-    if not cart:
-        cart = {"phone": user_phone, "items": []}
+    # Fetch or initialize cart
+    cart = await carts_col().find_one({"phone": user_phone}) or {"phone": user_phone, "items": []}
 
-    # If quantity == 0 → remove this product from the cart
-    if req.quantity == 0:
-        cart["items"] = [item for item in cart["items"] if item["id"] != str(req.product_id)]
+    # Try to find product in cart
+    existing_item = next((item for item in cart["items"] if item["id"] == product_id), None)
 
-        if cart["items"]:
-            await carts_col().update_one({"phone": user_phone}, {"$set": cart})
+    if existing_item:
+        new_qty = existing_item["qty"] + req.quantity
+
+        # Quantity drop → remove or update
+        if new_qty <= 0:
+            cart["items"].remove(existing_item)
+            message = f"Removed {product_info['name']} from your cart."
+        elif new_qty > available_qty:
+            raise HTTPException(status_code=400, detail=f"Only {available_qty} units available.")
         else:
-            await carts_col().delete_one({"phone": user_phone})
+            existing_item["qty"] = new_qty
+            message = f"Updated {product_info['name']} quantity to {new_qty}."
+    else:
+        # Add new product if quantity > 0
+        if req.quantity <= 0:
+            raise HTTPException(status_code=400, detail="Quantity must be greater than 0 for new items.")
+        if req.quantity > available_qty:
+            raise HTTPException(status_code=400, detail=f"Only {available_qty} units available.")
+        cart["items"].append({**product_info, "qty": req.quantity})
+        message = f"Added {product_info['name']} to your cart."
 
-        logger.info("Removed product %s from cart for user %s", req.product_id, user_phone)
-        return {"message": "Product removed from cart", "cart": cart.get("items", [])}
+    # Delete empty cart or save updates
+    if not cart["items"]:
+        await carts_col().delete_one({"phone": user_phone})
+        return {"message": "Cart is now empty."}
 
-    # Otherwise, update or add item
-    item_found = False
-    for item in cart["items"]:
-        if item["id"] == str(req.product_id):
-            new_qty = item["qty"] + req.quantity
-            if new_qty > available_qty:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Cannot add more than {available_qty} items to cart (already {item['qty']} added)"
-                )
-            item["qty"] = new_qty
-            item_found = True
-            break
-
-    if not item_found:
-        cart["items"].append({"id": str(req.product_id), "qty": req.quantity})
-
-    # Save back to DB
     await carts_col().update_one({"phone": user_phone}, {"$set": cart}, upsert=True)
-    logger.info("Cart updated for user: %s", user_phone)
 
-    return {"message": "Added to cart", "cart": cart["items"]}
+    return {
+        "message": message,
+        "cart": cart["items"],
+        "total_items": sum(item["qty"] for item in cart["items"]),
+        "total_price": sum(item["price"] * item["qty"] for item in cart["items"]),
+    }
+
 
 
 
@@ -397,27 +403,77 @@ async def get_orders(user_phone: str = Depends(get_current_user)):
 
 @app.get("/admin/orders")
 async def get_all_orders():
-    """This is for admin side Order list getting"""
+    """Admin API — Fetch all orders with user info, total price, and product details."""
     logger.info("Fetching all orders for admin")
 
-    cursor = orders_col().find({}, {"_id": 1, "status": 1, "created_at": 1, "user.phone": 1})
+    cursor = orders_col().find({}, {
+        "_id": 1,
+        "status": 1,
+        "created_at": 1,
+        "user": 1,
+        "items": 1,
+        "total_amount": 1
+    })
 
     orders = []
     async for order in cursor:
+        user = order.get("user", {})
+        items = order.get("items", [])
+        total_amount = order.get("total_amount")
+
+        # Fetch product details for each item
+        detailed_items = []
+        for item in items:
+            product_id = item.get("id")
+            product = await products_collection.find_one({"id": str(product_id)}, {"_id": 0})
+
+            if product:
+                detailed_items.append({
+                    "id": str(product_id),
+                    "name": product.get("name"),
+                    "image": product.get("image"),
+                    "price": product.get("price"),
+                    "qty": item.get("qty", 1),
+                    "subtotal": round(product.get("price", 0) * item.get("qty", 1), 2)
+                })
+            else:
+                detailed_items.append({
+                    "id": str(product_id),
+                    "name": "Product not found",
+                    "price": 0,
+                    "qty": item.get("qty", 1),
+                    "subtotal": 0
+                })
+
+        # Recalculate total if missing or outdated
+        if not total_amount or total_amount <= 0:
+            total_amount = sum(item["subtotal"] for item in detailed_items)
+
+        user_info = {
+            "name": user.get("name", "Unknown"),
+            "phone": user.get("phone", "Unknown"),
+            "email": user.get("email", "N/A"),
+            "address": user.get("address", "N/A"),
+        }
+
         orders.append({
             "order_id": str(order["_id"]),
             "status": order.get("status", "Unknown"),
             "created_at": order.get("created_at"),
-            "phone": order.get("user", {}).get("phone", "Unknown")
+            "user": user_info,
+            "items": detailed_items,
+            "total_amount": round(total_amount, 2),
+            "total_items": len(detailed_items),
         })
 
     return {"orders": orders}
+
 
 # ----- ORDER STATUS + DELIVERY OTP -----
 @app.post("/order/update-status/{order_id}")
 async def update_order_status(order_id: str, status: str):
     logger.info("Updating status for order %s to %s", order_id, status)
-    if status not in ["Order Placed", "Dispatched", "Delivered", "Cancelled"]:
+    if status not in ["Order Placed", "Out of Delivery", "Delivered", "Cancelled"]:
         raise HTTPException(status_code=400, detail="Invalid order status")
 
     try:
