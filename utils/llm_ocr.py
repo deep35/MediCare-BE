@@ -2,7 +2,12 @@ import base64
 import json
 from pathlib import Path
 from groq import Groq
+import os
+from dotenv import load_dotenv
 
+load_dotenv()
+
+GROQ_API = os.getenv("GROQ_API_KEY")
 
 def encode_image(image_input):
     # Case 1 — bytes provided directly (UploadFile.read())
@@ -38,7 +43,7 @@ def get_meds(base64_img):
 
     base64_image = base64_img
 
-    client = Groq(api_key="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")
+    client = Groq(api_key=GROQ_API)
 
     chat_completion = client.chat.completions.create(
         messages=[
