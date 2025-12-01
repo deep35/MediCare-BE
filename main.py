@@ -4,9 +4,14 @@ import hmac
 import hashlib
 import uuid
 import logging
+import requests
+import imghdr
+import fitz
+from io import BytesIO
+from PIL import Image
 from bson import ObjectId
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends 
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,11 +24,13 @@ import jwt
 from dotenv import load_dotenv
 from twilio.rest import Client
 from motor.motor_asyncio import AsyncIOMotorClient
+from utils.llm_ocr import *
 
 # Load env
 load_dotenv()
 
 # Config (from env)
+PRODUCTS_API_URL = "https://radhe-shyam-backend.azurewebsites.net/api/Products"
 REDIS_URL = os.getenv("REDIS_URL")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID")
@@ -560,3 +567,80 @@ async def verify_order_delivery(req: VerifyOrderDeliveryRequest):
         "order_id": req.order_id,
         "status": "Delivered"
     }
+
+@app.post("/ocr/prescription")
+async def ocr_prescription(file: UploadFile = File(...)):
+    img_bytes = await file.read()
+
+    if file.filename.lower().endswith(".pdf"):
+        try:
+            # CRITICAL FIX: Always wrap bytes with BytesIO().read()
+            pdf = fitz.open(stream=BytesIO(img_bytes).read(), filetype="pdf")
+        except Exception as e:
+            print("PDF ERROR:", e)
+            raise HTTPException(status_code=400, detail="Invalid PDF file")
+
+        pil_images = []
+
+        for page_index in range(len(pdf)):
+            try:
+                page = pdf.load_page(page_index)
+                pix = page.get_pixmap(dpi=200)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Error reading PDF page {page_index}")
+
+            # Convert Pixmap → PIL Image
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            pil_images.append(img)
+
+        # Merge all PDF pages vertically
+        total_height = sum(img.height for img in pil_images)
+        max_width = max(img.width for img in pil_images)
+
+        final_image = Image.new("RGB", (max_width, total_height), "white")
+
+        y_offset = 0
+        for img in pil_images:
+            final_image.paste(img, (0, y_offset))
+            y_offset += img.height
+
+        # Convert final merged image → bytes
+        buffer = BytesIO()
+        final_image.save(buffer, format="JPEG")
+        img_bytes = buffer.getvalue()
+
+    else:
+        if not imghdr.what(None, h=img_bytes):
+            raise HTTPException(status_code=400, detail="Invalid image file")
+
+    b64 = encode_image(img_bytes)
+
+    medicines = get_meds(b64)
+
+    extracted_names = [item["medicine"].strip().lower() for item in medicines]
+
+    try:
+        response = requests.get(PRODUCTS_API_URL, timeout=10)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Unable to reach product API")
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to fetch product list")
+
+    all_products = response.json()
+
+    matched_products = []
+
+    for product in all_products:
+        pname = product["name"].lower()
+
+        for med in extracted_names:
+            if med in pname:
+                matched_products.append({
+                    "id": product["id"],
+                    "name": product["name"]
+                })
+                break
+
+    return matched_products
+
