@@ -1,23 +1,24 @@
 import base64
 import json
 from pathlib import Path
-from groq import Groq
+import google.generativeai as genai
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-GROQ_API = os.getenv("GROQ_API_KEY")
+GEMINI_API = os.getenv("GEMINI_API_KEY")
+
+genai.configure(api_key=GEMINI_API)
+
 
 def encode_image(image_input):
-    # Case 1 — bytes provided directly (UploadFile.read())
     if isinstance(image_input, (bytes, bytearray)):
         return base64.b64encode(image_input).decode("utf-8")
 
-    # Case 2 — string or Path provided → treat as file path
     if isinstance(image_input, (str, Path)):
-        with open(image_input, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode("utf-8")
+        with open(image_input, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
 
     raise TypeError("encode_image expects bytes or a file path.")
 
@@ -38,31 +39,30 @@ def get_meds(base64_img):
     - Ignore numbers connected to units of strength or volume.
     - If no valid quantity is present, set quantity to 1.
     - Merge multiline medicine names into one item.
-    - Return only the medicine name and its correct quantity, nothing else.
+    - Return only the medicine name and its correct quantity.
     """
 
-    base64_image = base64_img
+    model = genai.GenerativeModel("gemini-2.5-flash")
 
-    client = Groq(api_key=GROQ_API)
+    # Gemini Vision → expects: [{"mime_type": "image/jpeg", "data": base64_bytes}]
+    image_part = {
+        "mime_type": "image/jpeg",
+        "data": base64.b64decode(base64_img),
+    }
 
-    chat_completion = client.chat.completions.create(
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}",
-                        },
-                    },
-                ],
-            }
+    response = model.generate_content(
+        [
+            prompt,
+            image_part
         ],
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        generation_config={"temperature": 0}
     )
 
-    result = chat_completion.choices[0].message.content
+    raw = response.text.strip()
 
-    return json.loads(result)
+    # Gemini sometimes wraps JSON in ```json blocks → clean it
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        raw = raw.replace("json", "").strip()
+
+    return json.loads(raw)
